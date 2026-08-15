@@ -26,6 +26,11 @@ local defaults = {
   width = 0.6,
   height = 10,
 
+  -- Display cells to allow for a pane title in the agent picker. Titles come
+  -- from the agent and can be long enough to stretch the picker across the whole
+  -- screen, since its width follows the longest row.
+  title_width = 40,
+
   -- Mark the lines being sent while the float is open: a background tint via
   -- the HerdrPromptSelection highlight, plus a sign in the gutter. Set to false
   -- to leave the buffer untouched.
@@ -34,8 +39,16 @@ local defaults = {
   sign_text = '▌',
 
   keys = {
+    -- Message float.
     send = '<C-s>',
     cancel = 'q',
+    -- Agent picker, shown when more than one agent is running. Each entry takes
+    -- a string or a list of them. The control-key aliases exist because an
+    -- active IME swallows <Space> and plain letters before Neovim sees them,
+    -- while control keys pass through; the first entry is what the footer shows.
+    mark = { '<Space>', '<C-x>' },
+    mark_all = { 'a', '<C-a>' },
+    confirm = '<CR>',
   },
 }
 
@@ -141,6 +154,15 @@ local function range_label(first, last)
   return first == last and tostring(first) or string.format('%d-%d', first, last)
 end
 
+-- Key options accept either a single lhs or a list of equivalents.
+local function key_list(spec)
+  return type(spec) == 'table' and spec or { spec }
+end
+
+local function key_label(spec)
+  return key_list(spec)[1]
+end
+
 local function dimension(value, total, minimum)
   local n = value <= 1 and (total * value) or value
   return math.max(minimum, math.floor(n))
@@ -174,40 +196,201 @@ local function agent_label(agent)
   return string.format('%s %s [%s]', agent.agent or 'agent', agent.pane_id, agent.agent_status or '?')
 end
 
-local function send_to(agent, payload)
+local function verb()
+  return config.submit and 'sent to' or 'staged in'
+end
+
+-- `quiet` suppresses the per-agent notification so a broadcast can report once.
+local function send_to(agent, payload, quiet)
   local args = config.submit and { 'agent', 'prompt', agent.pane_id, payload }
     or { 'pane', 'send-text', agent.pane_id, payload }
 
   local _, err = herdr(args)
   if err then
-    return vim.notify('herdr-prompt: ' .. err, vim.log.levels.ERROR)
+    vim.notify('herdr-prompt: ' .. err, vim.log.levels.ERROR)
+    return false
   end
-  vim.notify(string.format(
-    'herdr-prompt: %s %s',
-    config.submit and 'sent to' or 'staged in',
-    agent_label(agent)
-  ))
+  if not quiet then
+    vim.notify(string.format('herdr-prompt: %s %s', verb(), agent_label(agent)))
+  end
+  return true
+end
+
+local function send_to_many(agents, payload)
+  local sent = 0
+  for _, agent in ipairs(agents) do
+    if send_to(agent, payload, true) then
+      sent = sent + 1
+    end
+  end
+  vim.notify(string.format('herdr-prompt: %s %d/%d agents', verb(), sent, #agents))
+end
+
+-- Cut to display cells rather than bytes or characters: titles are often
+-- Japanese, where one character occupies two cells.
+local function truncate(s, limit)
+  if vim.fn.strdisplaywidth(s) <= limit then
+    return s
+  end
+  local width, keep = 0, 0
+  for i = 1, vim.fn.strchars(s) do
+    local cell = vim.fn.strdisplaywidth(vim.fn.strcharpart(s, i - 1, 1))
+    if width + cell > limit - 1 then -- leave a cell for the ellipsis
+      break
+    end
+    width, keep = width + cell, i
+  end
+  return vim.fn.strcharpart(s, 0, keep) .. '…'
+end
+
+-- The pane title earns its space in the picker: it is what tells two agents of
+-- the same kind apart. Bounded so one long title cannot widen the whole picker.
+local function picker_label(agent)
+  local title = agent.terminal_title_stripped
+  if title and title ~= '' then
+    return agent_label(agent) .. '  ' .. truncate(title, config.title_width)
+  end
+  return agent_label(agent)
+end
+
+-- Built here rather than delegated to vim.ui.select, whose callback takes a
+-- single item and so cannot express "these three". Marks make one UI cover
+-- picking one, some, or all of them.
+local function pick_agents(agents, on_confirm)
+  local marked = {}
+
+  local function marked_count()
+    return vim.tbl_count(marked)
+  end
+
+  local function line_at(i)
+    return (marked[i] and '✓ ' or '  ') .. picker_label(agents[i])
+  end
+
+  local lines = {}
+  for i = 1, #agents do
+    lines[i] = line_at(i)
+  end
+
+  local function footer_line()
+    local n = marked_count()
+    -- Spell out the target: "1 marked" and no marks at all both send one agent,
+    -- but to a different one, so a bare count would be ambiguous.
+    local target = n > 0 and string.format('%d marked', n) or 'this one'
+    return string.format(
+      ' %s mark · %s all · %s send %s · %s cancel ',
+      key_label(config.keys.mark),
+      key_label(config.keys.mark_all),
+      key_label(config.keys.confirm),
+      target,
+      key_label(config.keys.cancel)
+    )
+  end
+
+  local width = vim.fn.strdisplaywidth(footer_line())
+  for _, line in ipairs(lines) do
+    width = math.max(width, vim.fn.strdisplaywidth(line))
+  end
+  width = math.min(width + 2, vim.o.columns - 4)
+  local height = math.min(#agents, math.max(3, math.floor((vim.o.lines - vim.o.cmdheight) / 2)))
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].bufhidden = 'wipe'
+
+  local function window_config()
+    return {
+      relative = 'editor',
+      width = width,
+      height = height,
+      row = math.max(0, math.floor((vim.o.lines - height) / 2) - 1),
+      col = math.max(0, math.floor((vim.o.columns - width) / 2)),
+      border = 'rounded',
+      style = 'minimal',
+      title = ' Send to ',
+      title_pos = 'center',
+      footer = footer_line(),
+      footer_pos = 'center',
+    }
+  end
+
+  local win = vim.api.nvim_open_win(buf, true, window_config())
+  vim.wo[win].cursorline = true
+  -- 'wrap' is not one of the options style = 'minimal' resets, so a global
+  -- `set wrap` carries over. A wrapped row would break the one-row-per-agent
+  -- height and push the last candidates out of the window.
+  vim.wo[win].wrap = false
+
+  local function redraw()
+    vim.bo[buf].modifiable = true
+    for i = 1, #agents do
+      vim.api.nvim_buf_set_lines(buf, i - 1, i, false, { line_at(i) })
+    end
+    vim.bo[buf].modifiable = false
+    vim.api.nvim_win_set_config(win, window_config())
+  end
+
+  local function close()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end
+
+  local function map(spec, fn, desc)
+    for _, lhs in ipairs(key_list(spec)) do
+      vim.keymap.set('n', lhs, fn, { buffer = buf, nowait = true, silent = true, desc = desc })
+    end
+  end
+
+  map(config.keys.mark, function()
+    local line = vim.api.nvim_win_get_cursor(win)[1]
+    marked[line] = not marked[line] and true or nil
+    redraw()
+    -- Advance so a run of agents can be marked without moving separately.
+    if line < #agents then
+      vim.api.nvim_win_set_cursor(win, { line + 1, 0 })
+    end
+  end, 'Toggle mark')
+
+  map(config.keys.mark_all, function()
+    local all = marked_count() == #agents
+    for i = 1, #agents do
+      marked[i] = not all and true or nil
+    end
+    redraw()
+  end, 'Toggle all marks')
+
+  map(config.keys.confirm, function()
+    local indexes = vim.tbl_keys(marked)
+    -- Nothing marked means "just this one", so <CR> stays a single keystroke for
+    -- the common case.
+    if #indexes == 0 then
+      indexes = { vim.api.nvim_win_get_cursor(win)[1] }
+    end
+    table.sort(indexes)
+
+    local chosen = {}
+    for _, i in ipairs(indexes) do
+      table.insert(chosen, agents[i])
+    end
+    close()
+    on_confirm(chosen)
+  end, 'Send')
+
+  map(config.keys.cancel, close, 'Cancel')
+  map('<Esc>', close, 'Cancel')
 end
 
 local function pick_and_send(agents, payload)
   if #agents == 1 then
     return send_to(agents[1], payload)
   end
-  vim.ui.select(agents, {
-    prompt = 'herdr agent',
-    format_item = function(agent)
-      -- The pane title is worth the space here: it is what tells two agents of
-      -- the same kind apart.
-      local title = agent.terminal_title_stripped
-      if title and title ~= '' then
-        return agent_label(agent) .. '  ' .. title
-      end
-      return agent_label(agent)
-    end,
-  }, function(choice)
-    if choice then
-      send_to(choice, payload)
+  pick_agents(agents, function(chosen)
+    if #chosen == 1 then
+      return send_to(chosen[1], payload)
     end
+    send_to_many(chosen, payload)
   end)
 end
 
@@ -216,7 +399,12 @@ end
 -- where the message is about to go.
 local function footer_text(agents)
   local target = #agents == 1 and agent_label(agents[1]) or string.format('%d agents', #agents)
-  return string.format(' %s send → %s · %s cancel ', config.keys.send, target, config.keys.cancel)
+  return string.format(
+    ' %s send → %s · %s cancel ',
+    key_label(config.keys.send),
+    target,
+    key_label(config.keys.cancel)
+  )
 end
 
 -- Decide where the float lives, given the tallest it may grow to. Judging on the
@@ -369,6 +557,10 @@ function M.open(opts)
   })
 
   local function close()
+    -- Leave insert mode along with the float. <C-s> works from insert mode, and
+    -- what comes next is either the picker, whose buffer is not modifiable, or
+    -- the code buffer, which should not be entered in insert mode.
+    vim.cmd('stopinsert')
     if vim.api.nvim_win_is_valid(win) then
       vim.api.nvim_win_close(win, true)
     end
@@ -384,8 +576,12 @@ function M.open(opts)
     pick_and_send(agents, build_payload(message, subject))
   end
 
-  vim.keymap.set({ 'n', 'i' }, config.keys.send, submit, { buffer = buf, desc = 'Send to agent' })
-  vim.keymap.set('n', config.keys.cancel, close, { buffer = buf, nowait = true, desc = 'Cancel' })
+  for _, lhs in ipairs(key_list(config.keys.send)) do
+    vim.keymap.set({ 'n', 'i' }, lhs, submit, { buffer = buf, desc = 'Send to agent' })
+  end
+  for _, lhs in ipairs(key_list(config.keys.cancel)) do
+    vim.keymap.set('n', lhs, close, { buffer = buf, nowait = true, desc = 'Cancel' })
+  end
   vim.cmd('startinsert')
 end
 

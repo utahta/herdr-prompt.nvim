@@ -67,9 +67,25 @@ File: lua/herdr-prompt/init.lua:42-58
 
 The target is resolved from `herdr agent list`: agents whose working directory
 matches the current git root (or cwd) are candidates. With exactly one match it
-is used directly. With several, a picker shows the pane id, the agent status
-(`idle` / `working` / `blocked`) and the pane title, so you can avoid
-interrupting an agent mid-turn.
+is used directly. With several, a picker opens.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | move |
+| `<Space>` / `<C-x>` | toggle a mark |
+| `a` / `<C-a>` | toggle all marks |
+| `<CR>` | send to the marked agents, or to the line under the cursor when none are marked |
+| `q` / `<Esc>` | cancel |
+
+The control-key aliases matter with an input method active: an IME swallows
+`<Space>` and plain letters before Neovim sees them, while control keys pass
+through. So a question can be typed in Japanese and sent without touching the
+IME.
+
+Each row carries the agent kind, pane id, status (`idle` / `working` / `blocked`)
+and pane title, so an agent can be left alone mid-turn. Marking several sends the
+same message to each — one way to put a question to more than one agent and
+compare what comes back.
 
 If no agent is running in the project, nothing is asked and a warning is shown.
 
@@ -101,8 +117,14 @@ require('herdr-prompt').setup({
   sign_text = '▌',
 
   keys = {
+    -- Message float.
     send = '<C-s>',
     cancel = 'q',
+    -- Agent picker. Every key takes a string or a list of equivalents; the
+    -- first entry is the one shown in the footer.
+    mark = { '<Space>', '<C-x>' },
+    mark_all = { 'a', '<C-a>' },
+    confirm = '<CR>',
   },
 })
 ```
