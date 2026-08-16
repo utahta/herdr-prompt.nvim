@@ -1,10 +1,10 @@
 # herdr-prompt.nvim
 
-Ask a coding agent running in a [herdr](https://herdr.dev) pane about the code in
-front of you, without leaving Neovim.
+Ask one or more coding agents already running in [herdr](https://herdr.dev) panes
+about the code in front of you, without switching panes.
 
 Select some code, type a question, press `<C-s>`. The selection and its file
-reference are handed to the agent through the herdr CLI.
+reference are handed to each agent through the herdr CLI.
 
 The whole UI is a single floating window. What it hands over is *which* code you
 are asking about and what you want to know: an agent can read the repository, run
