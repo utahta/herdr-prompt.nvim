@@ -1,11 +1,20 @@
--- Ask a coding agent running in a herdr pane about the code in front of you.
+-- Ask the coding agents running in this herdr workspace about the code in front
+-- of you.
 --
 -- The whole UI is one floating window placed just below the selection, with the
 -- selection highlighted behind it: type a message, press <C-s>, and the code
 -- plus its file reference is handed to the agent through the herdr CLI. Nothing
 -- else is shown, because everything else the agent can find out on its own.
+--
+-- The workspace is the boundary. An agent one workspace over would answer into a
+-- pane that is not on screen, which is the one thing this exists to avoid, so it
+-- is not a candidate even when it sits in the same repository.
 
 local M = {}
+
+-- Naming a file for an agent is its own concern, with no bearing on anything
+-- below: see lua/herdr-prompt/path.lua.
+local path = require('herdr-prompt.path')
 
 local defaults = {
   -- true  -> `herdr agent prompt`, which submits the message immediately.
@@ -38,14 +47,17 @@ local defaults = {
   -- Gutter marker for those lines. Set to nil for a tint with no sign.
   sign_text = '▌',
 
+  -- Each entry takes a string or a list of equivalents, of which the first is
+  -- what the footer shows.
   keys = {
     -- Message float.
     send = '<C-s>',
-    cancel = 'q',
-    -- Agent picker, shown when more than one agent is running. Each entry takes
-    -- a string or a list of them. The control-key aliases exist because an
-    -- active IME swallows <Space> and plain letters before Neovim sees them,
-    -- while control keys pass through; the first entry is what the footer shows.
+    -- Also closes the agent picker. <Esc> is only bound in normal mode, so the
+    -- first one leaves insert mode and the next one gives up on the message.
+    cancel = { 'q', '<Esc>' },
+    -- Agent picker, shown when more than one agent is running. The control-key
+    -- aliases exist because an active IME swallows <Space> and plain letters
+    -- before Neovim sees them, while control keys pass through.
     mark = { '<Space>', '<C-x>' },
     mark_all = { 'a', '<C-a>' },
     confirm = '<CR>',
@@ -63,8 +75,24 @@ local namespace = vim.api.nvim_create_namespace('herdr-prompt')
 vim.api.nvim_set_hl(0, 'HerdrPromptSelection', { default = true, link = 'DiffChange' })
 vim.api.nvim_set_hl(0, 'HerdrPromptSign', { default = true, link = 'DiffChange' })
 
+-- Marks an agent the file does not sit under, where the message has to name the
+-- file by absolute path. Linked to an error group rather than a comment one
+-- because it is a mismatch worth noticing before sending, not decoration.
+vim.api.nvim_set_hl(0, 'HerdrPromptOutside', { default = true, link = 'DiagnosticError' })
+
+local MARKER = '[outside cwd]'
+
 function M.setup(opts)
-  config = vim.tbl_deep_extend('force', vim.deepcopy(defaults), opts or {})
+  opts = opts or {}
+  config = vim.tbl_deep_extend('force', vim.deepcopy(defaults), opts)
+
+  -- A key option is a list, and tbl_deep_extend merges lists by index: passing
+  -- `cancel = { 'x' }` would otherwise leave the default's <Esc> sitting behind
+  -- it. Whatever the caller gave replaces the default outright, so a shorter list
+  -- really is shorter.
+  for name, spec in pairs(opts.keys or {}) do
+    config.keys[name] = spec
+  end
 end
 
 local function herdr(args)
@@ -77,20 +105,47 @@ local function herdr(args)
   return table.concat(out, '\n')
 end
 
--- Prefer the git root so that every buffer in a repository resolves to the same
--- project, whichever subdirectory Neovim was started from. Resolved because
--- repositories are often reached through symlinks.
-local function project_root()
-  local out = vim.fn.systemlist({ 'git', 'rev-parse', '--show-toplevel' })
-  if vim.v.shell_error == 0 and out[1] and out[1] ~= '' then
-    return vim.fn.resolve(out[1])
+-- The workspace this Neovim sits in, which is what bounds the candidates.
+--
+-- Whether it is in a pane at all only the environment can answer. `herdr pane
+-- current` with no argument reports whichever pane is focused, so from a Neovim
+-- started outside herdr it would hand back a stranger's workspace instead of
+-- admitting there is none.
+--
+-- Which workspace that pane is in is asked of herdr rather than read from
+-- HERDR_WORKSPACE_ID, because the env var is a snapshot from when the process
+-- started and `herdr pane move --workspace` can move the pane afterwards. The
+-- env var is the fallback.
+local function current_workspace()
+  local pane = vim.env.HERDR_PANE_ID
+  if not pane or pane == '' then
+    return nil
   end
-  return vim.fn.resolve(vim.fn.getcwd())
+
+  local raw = herdr({ 'pane', 'current', '--pane', pane })
+  if raw then
+    local ok, decoded = pcall(vim.json.decode, raw)
+    if ok then
+      local id = vim.tbl_get(decoded, 'result', 'pane', 'workspace_id')
+      if type(id) == 'string' and id ~= '' then
+        return id
+      end
+    end
+  end
+
+  local id = vim.env.HERDR_WORKSPACE_ID
+  return id ~= '' and id or nil
 end
 
--- Agents whose working directory is this project. herdr reports both cwd and
--- foreground_cwd; either matching is enough to call it the same project.
-local function project_agents()
+-- Candidates are the agents in this workspace, and nothing else. `elsewhere`
+-- carries the ones beyond it that hold this file under their directory, so a
+-- warning can say where the answer would have gone without sending it there.
+local function resolve_target(subject)
+  local workspace = current_workspace()
+  if not workspace then
+    return nil, 'Neovim is not running in a herdr pane'
+  end
+
   local raw, err = herdr({ 'agent', 'list' })
   if not raw then
     return nil, err or 'could not run `herdr agent list`'
@@ -105,17 +160,34 @@ local function project_agents()
     return nil, 'herdr reported no agents'
   end
 
-  local root = project_root()
-  local matched = {}
+  -- Two lists rather than a sort, so the agents that can reach the file come
+  -- first while each group keeps the order herdr reported.
+  local near, far, elsewhere = {}, {}, {}
   for _, agent in ipairs(all) do
-    for _, dir in ipairs({ agent.foreground_cwd, agent.cwd }) do
-      if dir and vim.fn.resolve(dir) == root then
-        table.insert(matched, agent)
-        break
-      end
+    if agent.workspace_id == workspace then
+      table.insert(path.outside(agent, subject.resolved) and far or near, agent)
+    elseif path.relative(agent, subject.resolved) then
+      table.insert(elsewhere, agent)
     end
   end
-  return matched
+  vim.list_extend(near, far)
+
+  return { agents = near, workspace = workspace, elsewhere = elsewhere }
+end
+
+-- Names the workspace that was searched, and points at an agent beyond it when
+-- one holds this file, since "no agent" is otherwise hard to act on.
+local function no_agent_message(target)
+  local message = 'no agent in workspace ' .. target.workspace
+  if #target.elsewhere == 0 then
+    return message
+  end
+
+  local ids = {}
+  for i = 1, math.min(2, #target.elsewhere) do
+    table.insert(ids, target.elsewhere[i].pane_id)
+  end
+  return message .. ' · this file is in the cwd of ' .. table.concat(ids, ', ')
 end
 
 -- The command always passes a range; without a visual selection line1 == line2,
@@ -139,17 +211,6 @@ local function diagnostics_between(first, last)
   return items
 end
 
-local function relative_path(root)
-  local path = vim.fn.resolve(vim.fn.expand('%:p'))
-  if path == '' then
-    return '[No Name]'
-  end
-  if path:sub(1, #root + 1) == root .. '/' then
-    return path:sub(#root + 2)
-  end
-  return path
-end
-
 local function range_label(first, last)
   return first == last and tostring(first) or string.format('%d-%d', first, last)
 end
@@ -170,9 +231,17 @@ end
 
 -- `subject` is captured before the float opens: once focus moves to the float,
 -- '%:p' and &filetype would describe the scratch buffer instead of the code.
-local function build_payload(message, subject)
+--
+-- The path is relative to the agent's own directory wherever that is possible,
+-- which is both what the agent would write itself and free of the home directory,
+-- and falls back to the absolute path only when the file sits outside it.
+local function build_payload(message, subject, agent)
   local out = {
-    string.format('File: %s:%s', subject.path, range_label(subject.first, subject.last)),
+    string.format(
+      'File: %s:%s',
+      path.relative(agent, subject.resolved) or subject.path,
+      range_label(subject.first, subject.last)
+    ),
     '',
     '```' .. subject.filetype,
   }
@@ -200,8 +269,13 @@ local function verb()
   return config.submit and 'sent to' or 'staged in'
 end
 
+-- The payload is built here rather than passed in, because the file reference is
+-- relative to the recipient's directory and so differs per agent. The message
+-- itself is the same for all of them.
+--
 -- `quiet` suppresses the per-agent notification so a broadcast can report once.
-local function send_to(agent, payload, quiet)
+local function send_to(agent, message, subject, quiet)
+  local payload = build_payload(message, subject, agent)
   local args = config.submit and { 'agent', 'prompt', agent.pane_id, payload }
     or { 'pane', 'send-text', agent.pane_id, payload }
 
@@ -216,10 +290,10 @@ local function send_to(agent, payload, quiet)
   return true
 end
 
-local function send_to_many(agents, payload)
+local function send_to_many(agents, message, subject)
   local sent = 0
   for _, agent in ipairs(agents) do
-    if send_to(agent, payload, true) then
+    if send_to(agent, message, subject, true) then
       sent = sent + 1
     end
   end
@@ -244,27 +318,53 @@ local function truncate(s, limit)
 end
 
 -- The pane title earns its space in the picker: it is what tells two agents of
--- the same kind apart. Bounded so one long title cannot widen the whole picker.
-local function picker_label(agent)
-  local title = agent.terminal_title_stripped
-  if title and title ~= '' then
-    return agent_label(agent) .. '  ' .. truncate(title, config.title_width)
+-- the same kind apart.
+--
+-- It comes last and takes only the room left over, because rows are not wrapped
+-- and the picker can be no wider than the screen: a title long enough to overflow
+-- would push whatever follows off the right edge unseen. The marker must not be
+-- what is lost, so it goes first and the title is what gives way.
+local function picker_label(agent, outside, room)
+  local label = agent_label(agent)
+  if outside then
+    label = label .. '  ' .. MARKER
   end
-  return agent_label(agent)
+
+  local title = agent.terminal_title_stripped
+  if not title or title == '' then
+    return label
+  end
+
+  local budget = math.min(config.title_width, room - vim.fn.strdisplaywidth(label) - 2)
+  if budget < 2 then -- not even one cell and the ellipsis
+    return label
+  end
+  return label .. '  ' .. truncate(title, budget)
 end
 
 -- Built here rather than delegated to vim.ui.select, whose callback takes a
 -- single item and so cannot express "these three". Marks make one UI cover
 -- picking one, some, or all of them.
-local function pick_agents(agents, on_confirm)
+local function pick_agents(agents, subject, on_confirm)
   local marked = {}
+
+  -- What a row's text has to fit in: the window is capped at the screen below,
+  -- keeps two cells of padding, and every row carries a two-cell mark in front.
+  local room = vim.o.columns - 4 - 2 - 2
+
+  -- Built once here and not in line_at: the rows are rewritten on every mark,
+  -- and each label costs a symlink resolve.
+  local labels = {}
+  for i, agent in ipairs(agents) do
+    labels[i] = picker_label(agent, path.outside(agent, subject.resolved), room)
+  end
 
   local function marked_count()
     return vim.tbl_count(marked)
   end
 
   local function line_at(i)
-    return (marked[i] and '✓ ' or '  ') .. picker_label(agents[i])
+    return (marked[i] and '✓ ' or '  ') .. labels[i]
   end
 
   local lines = {}
@@ -299,6 +399,24 @@ local function pick_agents(agents, on_confirm)
   vim.bo[buf].modifiable = false
   vim.bo[buf].bufhidden = 'wipe'
 
+  -- Re-applied after every redraw, because rewriting a line drops the extmarks
+  -- sitting on it. The marker is found in the text rather than measured, since
+  -- the truncated title before it makes its column differ from row to row.
+  local function mark_outside()
+    vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
+    for i = 1, #agents do
+      local col = line_at(i):find(MARKER, 1, true)
+      if col then
+        vim.api.nvim_buf_set_extmark(buf, namespace, i - 1, col - 1, {
+          end_col = col - 1 + #MARKER,
+          hl_group = 'HerdrPromptOutside',
+        })
+      end
+    end
+  end
+
+  mark_outside()
+
   local function window_config()
     return {
       relative = 'editor',
@@ -328,6 +446,7 @@ local function pick_agents(agents, on_confirm)
       vim.api.nvim_buf_set_lines(buf, i - 1, i, false, { line_at(i) })
     end
     vim.bo[buf].modifiable = false
+    mark_outside()
     vim.api.nvim_win_set_config(win, window_config())
   end
 
@@ -379,32 +498,38 @@ local function pick_agents(agents, on_confirm)
   end, 'Send')
 
   map(config.keys.cancel, close, 'Cancel')
-  map('<Esc>', close, 'Cancel')
 end
 
-local function pick_and_send(agents, payload)
-  if #agents == 1 then
-    return send_to(agents[1], payload)
+-- A lone agent that can reach the file needs no picker. One that cannot goes
+-- through it anyway: the message would carry an absolute path into a directory
+-- the agent is not working in, and in a workspace of several tabs that agent may
+-- not even be on screen, so it is worth a deliberate keystroke.
+local function pick_and_send(agents, message, subject)
+  if #agents == 1 and not path.outside(agents[1], subject.resolved) then
+    return send_to(agents[1], message, subject)
   end
-  pick_agents(agents, function(chosen)
+  pick_agents(agents, subject, function(chosen)
     if #chosen == 1 then
-      return send_to(chosen[1], payload)
+      return send_to(chosen[1], message, subject)
     end
-    send_to_many(chosen, payload)
+    send_to_many(chosen, message, subject)
   end)
 end
 
 -- Key help lives in the border footer rather than in the buffer, so it can
 -- never end up in the message. Naming the target here also makes it obvious
--- where the message is about to go.
-local function footer_text(agents)
+-- where the message is about to go, and marks the case where it will carry an
+-- absolute path, which is on screen for the whole time the message is typed.
+local function footer_text(agents, subject)
   local target = #agents == 1 and agent_label(agents[1]) or string.format('%d agents', #agents)
-  return string.format(
-    ' %s send → %s · %s cancel ',
-    key_label(config.keys.send),
-    target,
-    key_label(config.keys.cancel)
-  )
+  local chunks = {
+    { string.format(' %s send → %s', key_label(config.keys.send), target), 'FloatFooter' },
+  }
+  if #agents == 1 and path.outside(agents[1], subject.resolved) then
+    table.insert(chunks, { ' ' .. MARKER, 'HerdrPromptOutside' })
+  end
+  table.insert(chunks, { string.format(' · %s cancel ', key_label(config.keys.cancel)), 'FloatFooter' })
+  return chunks
 end
 
 -- Decide where the float lives, given the tallest it may grow to. Judging on the
@@ -437,26 +562,33 @@ end
 function M.open(opts)
   opts = opts or {}
 
-  -- Resolve the target before asking for a message, so a missing agent is
-  -- reported before anything is typed.
-  local agents, err = project_agents()
-  if not agents then
-    return vim.notify('herdr-prompt: ' .. err, vim.log.levels.ERROR)
-  end
-  if #agents == 0 then
-    return vim.notify('herdr-prompt: no agent running in ' .. project_root(), vim.log.levels.WARN)
-  end
-
   local origin_buf = vim.api.nvim_get_current_buf()
   local first, last, lines = selected_lines(opts)
+  local path = vim.fn.expand('%:p')
   local subject = {
-    path = relative_path(project_root()),
+    -- `path` is left unresolved because it is what the absolute-path fallback
+    -- sends, and a symlink is how the file was opened, so it is the name the
+    -- agent is likelier to recognise. `resolved` is the one compared against an
+    -- agent's directory, and is nil for a buffer with no file at all.
+    path = path ~= '' and path or '[No Name]',
+    resolved = path ~= '' and vim.fn.resolve(path) or nil,
     filetype = vim.bo.filetype or '',
     first = first,
     last = last,
     lines = lines,
     diagnostics = config.include_diagnostics and diagnostics_between(first, last) or {},
   }
+
+  -- Resolve the target before asking for a message, so a missing agent is
+  -- reported before anything is typed.
+  local target, err = resolve_target(subject)
+  if not target then
+    return vim.notify('herdr-prompt: ' .. err, vim.log.levels.ERROR)
+  end
+  if #target.agents == 0 then
+    return vim.notify('herdr-prompt: ' .. no_agent_message(target), vim.log.levels.WARN)
+  end
+  local agents = target.agents
 
   local usable = vim.o.lines - vim.o.cmdheight
   local width = dimension(config.width, vim.o.columns, 40)
@@ -484,7 +616,7 @@ function M.open(opts)
 
   local col = math.max(0, math.floor((vim.o.columns - width) / 2))
   local title = string.format(' Ask agent · %s:%s ', vim.fn.fnamemodify(subject.path, ':t'), range_label(first, last))
-  local footer = footer_text(agents)
+  local footer = footer_text(agents, subject)
 
   -- Rebuilt on every resize: nvim_win_set_config drops anything left out, so
   -- title and footer have to be passed again each time.
@@ -573,7 +705,7 @@ function M.open(opts)
     if table.concat(message, ''):gsub('%s', '') == '' then
       return vim.notify('herdr-prompt: empty message, nothing sent', vim.log.levels.WARN)
     end
-    pick_and_send(agents, build_payload(message, subject))
+    pick_and_send(agents, message, subject)
   end
 
   for _, lhs in ipairs(key_list(config.keys.send)) do
