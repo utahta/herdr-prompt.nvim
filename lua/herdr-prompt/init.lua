@@ -12,6 +12,10 @@
 
 local M = {}
 
+-- Naming a file for an agent is its own concern, with no bearing on anything
+-- below: see lua/herdr-prompt/path.lua.
+local path = require('herdr-prompt.path')
+
 local defaults = {
   -- true  -> `herdr agent prompt`, which submits the message immediately.
   -- false -> `herdr pane send-text`, which only types it into the agent's
@@ -121,67 +125,6 @@ local function current_workspace()
   return id ~= '' and id or nil
 end
 
--- The directory an agent resolves relative paths against. foreground_cwd follows
--- whichever process currently holds the pane's terminal, so it moves as the agent
--- runs commands; it is only here for a pane that reports no cwd of its own.
--- Spelled out rather than looped over a list of the two, because a list built
--- from a missing cwd has a hole in it and ipairs would stop before reaching the
--- fallback.
-local function base_dir(agent)
-  local dir = agent.cwd
-  if type(dir) ~= 'string' or dir == '' then
-    dir = agent.foreground_cwd
-  end
-  if type(dir) ~= 'string' or dir == '' then
-    return nil
-  end
-  return dir
-end
-
--- Stands in for vim.fs.relpath(), which normalises with environment expansion
--- left on: a file honestly named `$HOME.lua` comes back as `Users/you.lua`, a
--- path that does not exist, and the agent would be handed a reference to
--- nothing. Both sides are normalised with that expansion off instead.
---
--- Comparing against `base .. '/'` is what keeps a sibling out: /repo-other is not
--- under /repo even though it shares the prefix. It also answers the case where
--- the two are the same directory, which a directory opened as a buffer can reach:
--- the tail comes out empty and nil sends the absolute path, since '.' would not
--- be a file reference.
-local function relpath_under(base, target)
-  base = vim.fs.normalize(base, { expand_env = false })
-  target = vim.fs.normalize(target, { expand_env = false })
-
-  local prefix = base:sub(-1) == '/' and base or base .. '/'
-  if target:sub(1, #prefix) ~= prefix then
-    return nil
-  end
-
-  local rel = target:sub(#prefix + 1)
-  return rel ~= '' and rel or nil
-end
-
--- The subject as this agent can name it, or nil when the file lies outside the
--- agent's directory.
---
--- Both sides are resolved: herdr passes on the cwd a shell reported, which keeps
--- symlinks, while the file path is resolved, and comparing them unevenly would
--- miss a match. What comes back is the single fact behind both the absolute-path
--- fallback and the marker, so the two cannot disagree.
-local function agent_relpath(agent, subject)
-  local base = base_dir(agent)
-  if not base or not subject.resolved then
-    return nil
-  end
-  return relpath_under(vim.fn.resolve(base), subject.resolved)
-end
-
--- A buffer with no file at all has no path either way, so it is not "outside"
--- anything: it neither carries the marker nor forces the picker.
-local function outside_cwd(agent, subject)
-  return subject.resolved ~= nil and agent_relpath(agent, subject) == nil
-end
-
 -- Candidates are the agents in this workspace, and nothing else. `elsewhere`
 -- carries the ones beyond it that hold this file under their directory, so a
 -- warning can say where the answer would have gone without sending it there.
@@ -210,8 +153,8 @@ local function resolve_target(subject)
   local near, far, elsewhere = {}, {}, {}
   for _, agent in ipairs(all) do
     if agent.workspace_id == workspace then
-      table.insert(outside_cwd(agent, subject) and far or near, agent)
-    elseif agent_relpath(agent, subject) then
+      table.insert(path.outside(agent, subject.resolved) and far or near, agent)
+    elseif path.relative(agent, subject.resolved) then
       table.insert(elsewhere, agent)
     end
   end
@@ -284,7 +227,7 @@ local function build_payload(message, subject, agent)
   local out = {
     string.format(
       'File: %s:%s',
-      agent_relpath(agent, subject) or subject.path,
+      path.relative(agent, subject.resolved) or subject.path,
       range_label(subject.first, subject.last)
     ),
     '',
@@ -401,7 +344,7 @@ local function pick_agents(agents, subject, on_confirm)
   -- and each label costs a symlink resolve.
   local labels = {}
   for i, agent in ipairs(agents) do
-    labels[i] = picker_label(agent, outside_cwd(agent, subject), room)
+    labels[i] = picker_label(agent, path.outside(agent, subject.resolved), room)
   end
 
   local function marked_count()
@@ -551,7 +494,7 @@ end
 -- the agent is not working in, and in a workspace of several tabs that agent may
 -- not even be on screen, so it is worth a deliberate keystroke.
 local function pick_and_send(agents, message, subject)
-  if #agents == 1 and not outside_cwd(agents[1], subject) then
+  if #agents == 1 and not path.outside(agents[1], subject.resolved) then
     return send_to(agents[1], message, subject)
   end
   pick_agents(agents, subject, function(chosen)
@@ -571,7 +514,7 @@ local function footer_text(agents, subject)
   local chunks = {
     { string.format(' %s send → %s', key_label(config.keys.send), target), 'FloatFooter' },
   }
-  if #agents == 1 and outside_cwd(agents[1], subject) then
+  if #agents == 1 and path.outside(agents[1], subject.resolved) then
     table.insert(chunks, { ' ' .. MARKER, 'HerdrPromptOutside' })
   end
   table.insert(chunks, { string.format(' · %s cancel ', key_label(config.keys.cancel)), 'FloatFooter' })

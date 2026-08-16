@@ -147,6 +147,15 @@ require('herdr-prompt').setup({
 })
 ```
 
+## Tests
+
+```
+nvim --headless -u NONE -l tests/path_spec.lua
+```
+
+Covers how a file is named for a given agent, which is the part where a mistake
+is silent: the message would name a file that does not exist.
+
 ## License
 
 MIT
