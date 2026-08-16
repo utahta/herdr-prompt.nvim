@@ -45,11 +45,14 @@ Inside the float:
 | Key | Action |
 | --- | --- |
 | `<C-s>` | send to the agent (works in insert and normal mode) |
-| `q` | cancel |
+| `q` / `<Esc>` | cancel |
 
 These keys and the resolved target are shown in the float's footer
 (`<C-s> send → wG:p2 [idle] · q cancel`), so the help never becomes part of the
 message.
+
+Cancelling is bound in normal mode only, so the first `<Esc>` leaves insert mode
+and the next one gives up on the message.
 
 The message is sent as:
 
@@ -134,12 +137,15 @@ require('herdr-prompt').setup({
   highlight_selection = true,
   sign_text = '▌',
 
+  -- Every key takes a string or a list of equivalents; the first entry is the one
+  -- shown in the footer. A list given here replaces the default rather than
+  -- merging into it, so `cancel = { 'q' }` really does drop `<Esc>`.
   keys = {
     -- Message float.
     send = '<C-s>',
-    cancel = 'q',
-    -- Agent picker. Every key takes a string or a list of equivalents; the
-    -- first entry is the one shown in the footer.
+    -- Cancelling also applies to the agent picker.
+    cancel = { 'q', '<Esc>' },
+    -- Agent picker.
     mark = { '<Space>', '<C-x>' },
     mark_all = { 'a', '<C-a>' },
     confirm = '<CR>',

@@ -47,14 +47,17 @@ local defaults = {
   -- Gutter marker for those lines. Set to nil for a tint with no sign.
   sign_text = '▌',
 
+  -- Each entry takes a string or a list of equivalents, of which the first is
+  -- what the footer shows.
   keys = {
     -- Message float.
     send = '<C-s>',
-    cancel = 'q',
-    -- Agent picker, shown when more than one agent is running. Each entry takes
-    -- a string or a list of them. The control-key aliases exist because an
-    -- active IME swallows <Space> and plain letters before Neovim sees them,
-    -- while control keys pass through; the first entry is what the footer shows.
+    -- Also closes the agent picker. <Esc> is only bound in normal mode, so the
+    -- first one leaves insert mode and the next one gives up on the message.
+    cancel = { 'q', '<Esc>' },
+    -- Agent picker, shown when more than one agent is running. The control-key
+    -- aliases exist because an active IME swallows <Space> and plain letters
+    -- before Neovim sees them, while control keys pass through.
     mark = { '<Space>', '<C-x>' },
     mark_all = { 'a', '<C-a>' },
     confirm = '<CR>',
@@ -80,7 +83,16 @@ vim.api.nvim_set_hl(0, 'HerdrPromptOutside', { default = true, link = 'Diagnosti
 local MARKER = '[outside cwd]'
 
 function M.setup(opts)
-  config = vim.tbl_deep_extend('force', vim.deepcopy(defaults), opts or {})
+  opts = opts or {}
+  config = vim.tbl_deep_extend('force', vim.deepcopy(defaults), opts)
+
+  -- A key option is a list, and tbl_deep_extend merges lists by index: passing
+  -- `cancel = { 'x' }` would otherwise leave the default's <Esc> sitting behind
+  -- it. Whatever the caller gave replaces the default outright, so a shorter list
+  -- really is shorter.
+  for name, spec in pairs(opts.keys or {}) do
+    config.keys[name] = spec
+  end
 end
 
 local function herdr(args)
@@ -486,7 +498,6 @@ local function pick_agents(agents, subject, on_confirm)
   end, 'Send')
 
   map(config.keys.cancel, close, 'Cancel')
-  map('<Esc>', close, 'Cancel')
 end
 
 -- A lone agent that can reach the file needs no picker. One that cannot goes
