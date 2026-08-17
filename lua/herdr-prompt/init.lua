@@ -82,6 +82,9 @@ vim.api.nvim_set_hl(0, 'HerdrPromptOutside', { default = true, link = 'Diagnosti
 
 local MARKER = '[outside cwd]'
 
+-- CTRL-V, which is what visualmode() reports for a blockwise selection.
+local CTRL_V = '\22'
+
 function M.setup(opts)
   opts = opts or {}
   config = vim.tbl_deep_extend('force', vim.deepcopy(defaults), opts)
@@ -207,6 +210,51 @@ local function range_label(first, last)
   return first == last and tostring(first) or string.format('%d-%d', first, last)
 end
 
+-- The text a charwise or blockwise selection covers, so that selecting a word
+-- sends the word rather than the line it sits on. Returns nothing for a linewise
+-- selection, where whole lines are the point.
+--
+-- The command is handed line numbers and nothing else, so the columns come from
+-- the '< and '> marks and the kind of selection from visualmode(). Both describe
+-- the *last* visual selection, which is this one only if its lines are the range
+-- the command was given: an explicit `:42,45HerdrPrompt` would otherwise be cut
+-- down to whatever had been selected before it.
+--
+-- getregion() does the cutting rather than the marks being sliced by hand. '> is
+-- the first byte of the last character, so a hand-rolled end column lands inside a
+-- multibyte one and truncates it; getregion() also knows v:maxcol, which is the '>
+-- column of a linewise selection.
+local function selected_region(first, last)
+  local mode = vim.fn.visualmode()
+  if mode ~= 'v' and mode ~= CTRL_V then
+    return nil
+  end
+
+  local from, to = vim.fn.getpos("'<"), vim.fn.getpos("'>")
+  if from[2] ~= first or to[2] ~= last then
+    return nil
+  end
+
+  local ok, lines = pcall(vim.fn.getregion, from, to, { type = mode })
+  if not ok or #lines == 0 then
+    return nil
+  end
+
+  -- Blockwise text is exact, but tinting it takes an extmark per line, and the
+  -- edge of a block reaching past a short line is a puzzle of its own. Those lines
+  -- are marked whole instead, which is the one place the tint is broader than what
+  -- is sent.
+  if mode == CTRL_V then
+    return lines
+  end
+
+  -- The byte lengths of what came back give the end column, which is why '> is not
+  -- consulted for it. A selection over several lines ends at the start of the last
+  -- one, so its length is the column outright.
+  local from_col = from[3] - 1
+  return lines, from_col, #lines == 1 and from_col + #lines[1] or #lines[#lines]
+end
+
 -- What the message is about, or a subject with nothing in it when no lines were
 -- named: `lines` being absent is what says the message goes on its own, and the
 -- rest of the fields go missing with it, which is exactly what the code below
@@ -222,6 +270,7 @@ local function subject_from(opts)
   local first = opts.line1
   local last = math.max(first, opts.line2 or first)
   local file = vim.fn.expand('%:p')
+  local region, from_col, to_col = selected_region(first, last)
   return {
     -- `path` is left unresolved because it is what the absolute-path fallback
     -- sends, and a symlink is how the file was opened, so it is the name the
@@ -232,7 +281,11 @@ local function subject_from(opts)
     filetype = vim.bo.filetype or '',
     first = first,
     last = last,
-    lines = vim.api.nvim_buf_get_lines(0, first - 1, last, false),
+    lines = region or vim.api.nvim_buf_get_lines(0, first - 1, last, false),
+    -- Present only where the selection stopped short of whole lines, and then the
+    -- byte range the tint should cover instead of them.
+    from_col = from_col,
+    to_col = to_col,
     diagnostics = config.include_diagnostics and diagnostics_between(first, last) or {},
   }
 end
@@ -618,12 +671,23 @@ function M.open(opts)
 
   -- One extmark per line: line_hl_group covers the whole line reliably, and
   -- sign_text has to be attached line by line to mark the full range.
+  --
+  -- The sign says which lines are involved either way. What is tinted is what is
+  -- actually being sent, so a selection that stopped short of whole lines tints
+  -- only its own bytes rather than laying claim to the rest of the line.
   if config.highlight_selection and subject.lines then
     for line = subject.first, subject.last do
       vim.api.nvim_buf_set_extmark(origin_buf, namespace, line - 1, 0, {
-        line_hl_group = 'HerdrPromptSelection',
+        line_hl_group = not subject.from_col and 'HerdrPromptSelection' or nil,
         sign_text = config.sign_text,
         sign_hl_group = 'HerdrPromptSign',
+      })
+    end
+    if subject.from_col then
+      vim.api.nvim_buf_set_extmark(origin_buf, namespace, subject.first - 1, subject.from_col, {
+        end_row = subject.last - 1,
+        end_col = subject.to_col,
+        hl_group = 'HerdrPromptSelection',
       })
     end
   end

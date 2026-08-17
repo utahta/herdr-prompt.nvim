@@ -72,12 +72,20 @@ The path is relative to the recipient's own working directory, which is how the
 agent would write it itself and keeps the home directory out of the transcript. A
 file outside that directory is named absolutely instead.
 
+What is sent is what was selected, down to the character: `viw` over an identifier
+sends the identifier, not the line it sits on. `V` still takes whole lines, and
+`<C-v>` takes the block. The `File:` line names the lines either way, which is
+anchor enough for an agent that can open the file itself.
+
 With nothing selected the message is the whole of it: no file reference, no code,
 no highlight in the buffer behind. Naming a file the question is not about would
-only send the agent looking in the wrong place, so a line is attached when one was
-selected and not otherwise — select a single line with `V` to ask about just that.
-The float's title says which it is, `Ask agent · init.lua:42-58` against a plain
-`Ask agent`.
+only send the agent looking in the wrong place, so code is attached when some was
+selected and not otherwise. The float's title says which it is,
+`Ask agent · init.lua:42-58` against a plain `Ask agent`.
+
+The tint behind the float covers exactly what is going out, so a selection that
+stopped short of whole lines tints only its own characters; the sign in the gutter
+marks the lines involved.
 
 ### Choosing the agent
 
