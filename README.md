@@ -4,7 +4,9 @@ Ask one or more coding agents already running in [herdr](https://herdr.dev) pane
 about the code in front of you, without switching panes.
 
 Select some code, type a question, press `<C-s>`. The selection and its file
-reference are handed to each agent through the herdr CLI.
+reference are handed to each agent through the herdr CLI. With nothing selected
+the message goes on its own, which is how to ask an agent anything at all without
+going to find its pane.
 
 The whole UI is a single floating window. What it hands over is *which* code you
 are asking about and what you want to know: an agent can read the repository, run
@@ -31,14 +33,14 @@ Plug 'utahta/herdr-prompt.nvim'
 ## Usage
 
 ```viml
-" ask about the visual selection, or the current line in normal mode
+" ask about the visual selection, or about nothing in particular from normal mode
 nnoremap <silent> <Leader>p :HerdrPrompt<CR>
 xnoremap <silent> <Leader>p :HerdrPrompt<CR>
 ```
 
 Map it with `:` and not `<Cmd>`. `<Cmd>` bypasses the command line, so the
-`'<,'>` range that visual mode inserts never reaches the command and only the
-cursor line would be sent.
+`'<,'>` range that visual mode inserts never reaches the command, and the message
+would go out with no code attached.
 
 Inside the float:
 
@@ -69,6 +71,13 @@ File: lua/herdr-prompt/init.lua:42-58
 The path is relative to the recipient's own working directory, which is how the
 agent would write it itself and keeps the home directory out of the transcript. A
 file outside that directory is named absolutely instead.
+
+With nothing selected the message is the whole of it: no file reference, no code,
+no highlight in the buffer behind. Naming a file the question is not about would
+only send the agent looking in the wrong place, so a line is attached when one was
+selected and not otherwise — select a single line with `V` to ask about just that.
+The float's title says which it is, `Ask agent · init.lua:42-58` against a plain
+`Ask agent`.
 
 ### Choosing the agent
 

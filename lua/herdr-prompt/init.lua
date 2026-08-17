@@ -190,14 +190,6 @@ local function no_agent_message(target)
   return message .. ' · this file is in the cwd of ' .. table.concat(ids, ', ')
 end
 
--- The command always passes a range; without a visual selection line1 == line2,
--- which makes the current line the subject.
-local function selected_lines(opts)
-  local first = opts.line1 or vim.fn.line('.')
-  local last = math.max(first, opts.line2 or first)
-  return first, last, vim.api.nvim_buf_get_lines(0, first - 1, last, false)
-end
-
 local function diagnostics_between(first, last)
   local items = {}
   for _, d in ipairs(vim.diagnostic.get(0)) do
@@ -215,6 +207,36 @@ local function range_label(first, last)
   return first == last and tostring(first) or string.format('%d-%d', first, last)
 end
 
+-- What the message is about, or a subject with nothing in it when no lines were
+-- named: `lines` being absent is what says the message goes on its own, and the
+-- rest of the fields go missing with it, which is exactly what the code below
+-- reads them as.
+--
+-- Captured before the float opens: once focus moves to the float, '%:p' and
+-- &filetype would describe the scratch buffer instead of the code.
+local function subject_from(opts)
+  if not opts.line1 then
+    return {}
+  end
+
+  local first = opts.line1
+  local last = math.max(first, opts.line2 or first)
+  local file = vim.fn.expand('%:p')
+  return {
+    -- `path` is left unresolved because it is what the absolute-path fallback
+    -- sends, and a symlink is how the file was opened, so it is the name the
+    -- agent is likelier to recognise. `resolved` is the one compared against an
+    -- agent's directory, and is nil for a buffer with no file at all.
+    path = file ~= '' and file or '[No Name]',
+    resolved = file ~= '' and vim.fn.resolve(file) or nil,
+    filetype = vim.bo.filetype or '',
+    first = first,
+    last = last,
+    lines = vim.api.nvim_buf_get_lines(0, first - 1, last, false),
+    diagnostics = config.include_diagnostics and diagnostics_between(first, last) or {},
+  }
+end
+
 -- Key options accept either a single lhs or a list of equivalents.
 local function key_list(spec)
   return type(spec) == 'table' and spec or { spec }
@@ -229,13 +251,17 @@ local function dimension(value, total, minimum)
   return math.max(minimum, math.floor(n))
 end
 
--- `subject` is captured before the float opens: once focus moves to the float,
--- '%:p' and &filetype would describe the scratch buffer instead of the code.
---
 -- The path is relative to the agent's own directory wherever that is possible,
 -- which is both what the agent would write itself and free of the home directory,
 -- and falls back to the absolute path only when the file sits outside it.
+--
+-- With nothing selected the message is the whole of it. Naming a file the question
+-- is not about would only send the agent looking in the wrong place.
 local function build_payload(message, subject, agent)
+  if not subject.lines then
+    return table.concat(message, '\n')
+  end
+
   local out = {
     string.format(
       'File: %s:%s',
@@ -544,6 +570,12 @@ end
 -- relative to it.
 local function float_placement(first, last, max_outer)
   local usable = vim.o.lines - vim.o.cmdheight
+  local centred = { pin = 'top', row = math.max(0, math.floor((usable - max_outer) / 2)) }
+
+  -- Nothing was selected, so there is nothing to sit beside or keep uncovered.
+  if not first then
+    return centred
+  end
 
   local below = vim.fn.screenpos(0, last, 1).row
   if below > 0 and below + max_outer <= usable then
@@ -555,29 +587,15 @@ local function float_placement(first, last, max_outer)
     return { pin = 'bottom', bottom = above - 1 }
   end
 
-  -- Selection is scrolled off screen, or the float fits nowhere near it.
-  return { pin = 'top', row = math.max(0, math.floor((usable - max_outer) / 2)) }
+  -- The selection is scrolled off screen, or the float fits nowhere near it.
+  return centred
 end
 
 function M.open(opts)
   opts = opts or {}
 
   local origin_buf = vim.api.nvim_get_current_buf()
-  local first, last, lines = selected_lines(opts)
-  local path = vim.fn.expand('%:p')
-  local subject = {
-    -- `path` is left unresolved because it is what the absolute-path fallback
-    -- sends, and a symlink is how the file was opened, so it is the name the
-    -- agent is likelier to recognise. `resolved` is the one compared against an
-    -- agent's directory, and is nil for a buffer with no file at all.
-    path = path ~= '' and path or '[No Name]',
-    resolved = path ~= '' and vim.fn.resolve(path) or nil,
-    filetype = vim.bo.filetype or '',
-    first = first,
-    last = last,
-    lines = lines,
-    diagnostics = config.include_diagnostics and diagnostics_between(first, last) or {},
-  }
+  local subject = subject_from(opts)
 
   -- Resolve the target before asking for a message, so a missing agent is
   -- reported before anything is typed.
@@ -596,12 +614,12 @@ function M.open(opts)
   -- line tall and grows with the message. Capped at half the screen, border
   -- included, so a short terminal still shows the code.
   local max_height = math.min(dimension(config.height, usable, 1), math.max(1, math.floor(usable / 2) - 2))
-  local placement = float_placement(first, last, max_height + 2)
+  local placement = float_placement(subject.first, subject.last, max_height + 2)
 
   -- One extmark per line: line_hl_group covers the whole line reliably, and
   -- sign_text has to be attached line by line to mark the full range.
-  if config.highlight_selection then
-    for line = first, last do
+  if config.highlight_selection and subject.lines then
+    for line = subject.first, subject.last do
       vim.api.nvim_buf_set_extmark(origin_buf, namespace, line - 1, 0, {
         line_hl_group = 'HerdrPromptSelection',
         sign_text = config.sign_text,
@@ -615,7 +633,15 @@ function M.open(opts)
   vim.bo[buf].bufhidden = 'wipe'
 
   local col = math.max(0, math.floor((vim.o.columns - width) / 2))
-  local title = string.format(' Ask agent · %s:%s ', vim.fn.fnamemodify(subject.path, ':t'), range_label(first, last))
+  -- Naming the code in the title is also what says there is any: a bare ' Ask
+  -- agent ' is how a message on its own announces itself.
+  local title = subject.lines
+      and string.format(
+        ' Ask agent · %s:%s ',
+        vim.fn.fnamemodify(subject.path, ':t'),
+        range_label(subject.first, subject.last)
+      )
+    or ' Ask agent '
   local footer = footer_text(agents, subject)
 
   -- Rebuilt on every resize: nvim_win_set_config drops anything left out, so
