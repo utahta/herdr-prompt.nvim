@@ -210,32 +210,24 @@ local function range_label(first, last)
   return first == last and tostring(first) or string.format('%d-%d', first, last)
 end
 
--- The text a charwise or blockwise selection covers, so that selecting a word
--- sends the word rather than the line it sits on. Returns nothing for a linewise
--- selection, where whole lines are the point.
+-- The text a snapshotted selection covers, so that selecting a word sends the
+-- word rather than the line it sits on. Returns nothing for a linewise selection,
+-- where whole lines are the point, and for anything getregion() cannot make sense
+-- of, leaving the caller its whole-lines fallback.
 --
--- The command is handed line numbers and nothing else, so the columns come from
--- the '< and '> marks and the kind of selection from visualmode(). Both describe
--- the *last* visual selection, which is this one only if its lines are the range
--- the command was given: an explicit `:42,45HerdrPrompt` would otherwise be cut
--- down to whatever had been selected before it.
+-- The snapshot was taken by the command while visual mode was still live, which is
+-- what makes it trustworthy: the '< and '> marks describe the *previous* selection
+-- until the current one ends, and are never consulted here.
 --
--- getregion() does the cutting rather than the marks being sliced by hand. '> is
--- the first byte of the last character, so a hand-rolled end column lands inside a
--- multibyte one and truncates it; getregion() also knows v:maxcol, which is the '>
--- column of a linewise selection.
-local function selected_region(first, last)
-  local mode = vim.fn.visualmode()
-  if mode ~= 'v' and mode ~= CTRL_V then
+-- getregion() does the cutting rather than the positions being sliced by hand. The
+-- end position sits on the first byte of the last character, so a hand-rolled end
+-- column lands inside a multibyte one and truncates it.
+local function selection_text(sel, first, last)
+  if sel.mode ~= 'v' and sel.mode ~= CTRL_V then
     return nil
   end
 
-  local from, to = vim.fn.getpos("'<"), vim.fn.getpos("'>")
-  if from[2] ~= first or to[2] ~= last then
-    return nil
-  end
-
-  local ok, lines = pcall(vim.fn.getregion, from, to, { type = mode })
+  local ok, lines = pcall(vim.fn.getregion, sel.from, sel.to, { type = sel.mode })
   if not ok or #lines == 0 then
     return nil
   end
@@ -244,33 +236,63 @@ local function selected_region(first, last)
   -- edge of a block reaching past a short line is a puzzle of its own. Those lines
   -- are marked whole instead, which is the one place the tint is broader than what
   -- is sent.
-  if mode == CTRL_V then
+  if sel.mode == CTRL_V then
     return lines
   end
 
-  -- The byte lengths of what came back give the end column, which is why '> is not
-  -- consulted for it. A selection over several lines ends at the start of the last
-  -- one, so its length is the column outright.
+  -- The leftmost end is where the tint starts. `from` is wherever the selection
+  -- was begun, which for one made backwards is its right edge.
+  local from = sel.from
+  if sel.to[2] < from[2] or (sel.to[2] == from[2] and sel.to[3] < from[3]) then
+    from = sel.to
+  end
+
+  -- The byte lengths of what came back give the end column. A selection over
+  -- several lines ends at the start of the last one, so its length is the column
+  -- outright.
   local from_col = from[3] - 1
-  return lines, from_col, #lines == 1 and from_col + #lines[1] or #lines[#lines]
+  local to_col = #lines == 1 and from_col + #lines[1] or #lines[#lines]
+
+  -- 'virtualedit' lets a selection reach past the end of a line, where getregion()
+  -- makes up the spaces that are not in the buffer. A column counted from those
+  -- would be out of range, and nvim_buf_set_extmark takes the whole float down
+  -- with it, so both ends are pinned to the lines they sit on.
+  local text = vim.api.nvim_buf_get_lines(0, first - 1, last, false)
+  return lines, math.min(from_col, #text[1]), math.min(to_col, #text[#text])
 end
 
--- What the message is about, or a subject with nothing in it when no lines were
+-- What the message is about, or a subject with nothing in it when nothing was
 -- named: `lines` being absent is what says the message goes on its own, and the
 -- rest of the fields go missing with it, which is exactly what the code below
 -- reads them as.
 --
+-- Which of the two shapes arrives was decided by the command: a live visual
+-- selection comes as `selection`, an explicit range as bare line numbers meaning
+-- those lines whole.
+--
 -- Captured before the float opens: once focus moves to the float, '%:p' and
 -- &filetype would describe the scratch buffer instead of the code.
 local function subject_from(opts)
-  if not opts.line1 then
+  local sel = opts.selection
+  if not sel and not opts.line1 then
     return {}
   end
 
-  local first = opts.line1
-  local last = math.max(first, opts.line2 or first)
+  local first, last
+  if sel then
+    first = math.min(sel.from[2], sel.to[2])
+    last = math.max(sel.from[2], sel.to[2])
+  else
+    first = opts.line1
+    last = math.max(first, opts.line2 or first)
+  end
+
+  local region, from_col, to_col
+  if sel then
+    region, from_col, to_col = selection_text(sel, first, last)
+  end
+
   local file = vim.fn.expand('%:p')
-  local region, from_col, to_col = selected_region(first, last)
   return {
     -- `path` is left unresolved because it is what the absolute-path fallback
     -- sends, and a symlink is how the file was opened, so it is the name the

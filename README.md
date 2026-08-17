@@ -34,13 +34,15 @@ Plug 'utahta/herdr-prompt.nvim'
 
 ```viml
 " ask about the visual selection, or about nothing in particular from normal mode
-nnoremap <silent> <Leader>p :HerdrPrompt<CR>
-xnoremap <silent> <Leader>p :HerdrPrompt<CR>
+nnoremap <Leader>p <Cmd>HerdrPrompt<CR>
+xnoremap <Leader>p <Cmd>HerdrPrompt<CR>
 ```
 
-Map it with `:` and not `<Cmd>`. `<Cmd>` bypasses the command line, so the
-`'<,'>` range that visual mode inserts never reaches the command, and the message
-would go out with no code attached.
+Map it with `<Cmd>`, which reaches the command while visual mode is still live:
+the selection is read directly, down to the character. A `:` mapping keeps
+working — the `'<,'>` it inserts arrives as an explicit range — but a range only
+names lines, so it sends whole lines. An explicit range typed by hand,
+`:42,45HerdrPrompt`, does the same.
 
 Inside the float:
 
